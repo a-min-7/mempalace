@@ -103,12 +103,15 @@ if _args.palace:
     os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
 
 _config = MempalaceConfig()
-# Only override KG path when --palace is explicitly provided; otherwise use
-# KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
-if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
-else:
-    _kg = KnowledgeGraph()
+# KG path is INDEPENDENT of --palace to avoid split-brain. --palace holds the
+# Chroma drawer store; the KG has its own canonical path. Honor an explicit
+# MEMPALACE_KG_PATH override (for the Emmy deployment), else KnowledgeGraph's
+# default (~/.mempalace/knowledge_graph.sqlite3). Fixes the prior bug where
+# passing --palace silently relocated the KG into the palace dir, diverging
+# from the default and reading an empty KG. Safe: the KG is empty everywhere,
+# so no data divergence to migrate.
+_kg_path = os.environ.get("MEMPALACE_KG_PATH")
+_kg = KnowledgeGraph(db_path=_kg_path) if _kg_path else KnowledgeGraph()
 
 
 _client_cache = None
