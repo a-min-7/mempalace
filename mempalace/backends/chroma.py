@@ -676,6 +676,60 @@ def _as_list(v: Any) -> list:
     return [v]
 
 
+def _strip_nul(value: Any) -> Any:
+    """Remove embedded NUL bytes from text bound for the store.
+
+    Why this exists (2026-09-13). ChromaDB builds an FTS5 index over drawer text
+    using ``tokenize='trigram'``. A row whose text contains an embedded NUL
+    produces a **malformed inverted index** — and the damage is silent, because
+    the obvious oracles are blind to it: ``LIKE`` and ``length()`` both truncate
+    at NUL, so a substring count still "matches" while the postings for those
+    rows are simply gone. Measured on a live deployment: **40 NUL-bearing rows
+    cost 10,703 index postings** — real recall loss, with no error raised
+    anywhere and ``integrity_check`` the only thing that noticed.
+
+    **Stripping, not raising, is deliberate.** A NUL arriving here means some
+    upstream transcript contained a control byte; raising would abort an entire
+    sweep over one byte that carries no meaning in prose. Note that
+    ``config.sanitize_content`` *does* raise — correct for the MCP path, where a
+    caller is present to see the error, and wrong for automated ingest. That
+    guard exists and is wired into ``mcp_server`` only; the sweeper and miners
+    never called it, which is how bad rows reached the index in the first place.
+
+    Placing this in the backend rather than at each writer is the point: all
+    ingest paths (sweeper, miner, convo_miner, sources/context, mcp_server)
+    funnel through the collection's write methods, so one guard covers them all.
+    """
+    if isinstance(value, str) and "\x00" in value:
+        return value.replace("\x00", "")
+    return value
+
+
+def _strip_nul_seq(values: Optional[list]) -> Optional[list]:
+    """Apply :func:`_strip_nul` across a documents list (no-op on None)."""
+    if values is None:
+        return None
+    return [_strip_nul(v) for v in values]
+
+
+def _strip_nul_metadatas(metadatas: Optional[list]) -> Optional[list]:
+    """Apply :func:`_strip_nul` to string values in each metadata dict.
+
+    Chroma stores drawer text in its metadata tables regardless, so a NUL in a
+    metadata string reaches the same index family. Cheaper to strip here than to
+    discover it there.
+    """
+    if metadatas is None:
+        return None
+    out = []
+    for md in metadatas:
+        if isinstance(md, dict):
+            out.append({k: _strip_nul(v) for k, v in md.items()})
+        else:
+            out.append(md)
+    return out
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results."""
 
@@ -687,17 +741,23 @@ class ChromaCollection(BaseCollection):
     # ------------------------------------------------------------------
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
+        kwargs: dict[str, Any] = {
+            "documents": _strip_nul_seq(documents),
+            "ids": ids,
+        }
         if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+            kwargs["metadatas"] = _strip_nul_metadatas(metadatas)
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
+        kwargs: dict[str, Any] = {
+            "documents": _strip_nul_seq(documents),
+            "ids": ids,
+        }
         if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+            kwargs["metadatas"] = _strip_nul_metadatas(metadatas)
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         self._collection.upsert(**kwargs)
@@ -714,9 +774,9 @@ class ChromaCollection(BaseCollection):
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
         kwargs: dict[str, Any] = {"ids": ids}
         if documents is not None:
-            kwargs["documents"] = documents
+            kwargs["documents"] = _strip_nul_seq(documents)
         if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+            kwargs["metadatas"] = _strip_nul_metadatas(metadatas)
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         self._collection.update(**kwargs)
