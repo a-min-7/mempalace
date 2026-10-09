@@ -1880,6 +1880,30 @@ def handle_request(request):
                     "id": req_id,
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
+        # Enforce the schema's `required` BEFORE dispatch.
+        #
+        # The checks above validate the tool NAME (-32601) and argument TYPES
+        # (-32602) but never required-ness. A call omitting a required argument
+        # therefore reached the handler and raised TypeError, which the broad
+        # except below reported as -32000 "Internal tool error" — telling the
+        # caller their own mistake was a server fault, and logging a full
+        # traceback for it. Measured on `mempalace_search` with no `query`
+        # (/tmp/mempalace-fleet.log, 2026-09-22 09:31:20 and 09:31:35).
+        #
+        # Audited before adding: every one of the 15 tools that declare
+        # `required` names parameters its handler genuinely requires (no
+        # defaults), so this cannot reject a call that succeeds today.
+        missing = [k for k in TOOLS[tool_name]["input_schema"].get("required", [])
+                   if k not in tool_args]
+        if missing:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Missing required parameter(s): " + ", ".join(missing),
+                },
+            }
         try:
             tool_args.pop("wait_for_previous", None)
             result = TOOLS[tool_name]["handler"](**tool_args)
