@@ -141,8 +141,179 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
             }
 
 
-# ── Cursor resolution ────────────────────────────────────────────────
+def _flatten_pi_content(content) -> str:
+    """Flatten a pi message content field to text.
 
+    pi uses the same block-list shape as Claude Code (``[{"type": "text",
+    "text": ...}, {"type": "thinking", ...}]``), so this mirrors
+    ``_flatten_content``'s behaviour: text blocks yield their text, anything
+    else is rendered as a bracketed marker rather than dropped, so a record
+    never silently loses a block it actually carried.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "thinking":
+                # pi stores reasoning in `thinking`; keep it, marked, because
+                # it is part of the record and this fleet reads it back.
+                parts.append(f"[thinking: {block.get('thinking', '')}]")
+            else:
+                parts.append(f"[{btype}: {json.dumps(block, default=str)}]")
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def parse_pi_jsonl(path: str) -> Iterator[dict]:
+    """Yield user/assistant records from a pi (pi-mono) session .jsonl.
+
+    pi stores a TREE-structured message log: each record carries ``id`` and
+    ``parentId`` plus a nested ``message`` with its own ``role``. The roles
+    observed in practice are ``user``, ``assistant``, ``toolResult`` and
+    ``bashExecution``. The first record is a ``session`` header carrying the
+    session id.
+
+    Mapping onto the CC shape the sweeper already consumes:
+
+      - ``user`` / ``assistant`` pass through unchanged.
+      - ``toolResult`` / ``bashExecution`` are yielded as **user-role**
+        records carrying a bracketed marker. That is not a hack: Claude Code
+        itself places tool results in user-role messages, and
+        ``_flatten_content`` renders them as ``[tool_result: ...]``. These are
+        real conversation content, so dropping them would lose the record.
+      - ``session``, ``model_change``, ``thinking_level_change`` are metadata
+        and are skipped.
+
+    Session id comes from the ``session`` header, falling back to the file's
+    stem (pi names files ``<ISO>_<uuid>.jsonl``). Malformed lines are skipped
+    silently, matching ``parse_claude_jsonl``.
+    """
+    session_id = None
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("type") == "session" and not session_id:
+                session_id = rec.get("id")
+                continue
+            if rec.get("type") != "message":
+                continue
+            records.append(rec)
+
+    if not session_id:
+        # pi filenames are "<ISO>_<uuid>.jsonl"; the uuid is the session id.
+        stem = Path(path).stem
+        session_id = stem.split("_", 1)[1] if "_" in stem else stem
+    if not session_id:
+        return
+
+    for rec in records:
+        msg = rec.get("message") or {}
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        timestamp = rec.get("timestamp") or msg.get("timestamp")
+        if not timestamp:
+            continue
+        uuid = rec.get("id")
+        if not uuid:
+            continue
+
+        if role in ("user", "assistant"):
+            content = _flatten_pi_content(msg.get("content", ""))
+            out_role = role
+        elif role == "toolResult":
+            tool = msg.get("toolName") or "?"
+            body = _flatten_pi_content(msg.get("content", ""))
+            err = " ERROR" if msg.get("isError") else ""
+            content = f"[tool_result{err}: {tool}] {body}"
+            out_role = "user"
+        elif role == "bashExecution":
+            cmd = msg.get("command", "")
+            out = msg.get("output", "")
+            code = msg.get("exitCode")
+            content = f"[bash: {cmd}]\nexit {code}\n{out}"
+            out_role = "user"
+        else:
+            continue
+
+        if not str(timestamp).strip() or not content.strip():
+            continue
+        yield {
+            "session_id": str(session_id),
+            "uuid": str(uuid),
+            "timestamp": str(timestamp),
+            "role": out_role,
+            "content": content,
+        }
+
+
+def detect_transcript_format(path: str, probe: int = 40) -> str:
+    """Sniff a .jsonl transcript and return ``"pi"`` or ``"claude"``.
+
+    The two formats are structurally distinguishable at the record level and
+    neither is a superset of the other:
+
+      - Claude Code: ``type`` is ``user``/``assistant``/..., and the role lives
+        in the nested ``message.role``.
+      - pi: ``type`` is ``message`` (or ``session``), with ``id``/``parentId``
+        and the role in ``message.role``.
+
+    A file that matches neither falls back to ``"claude"`` so behaviour for
+    every existing caller is unchanged -- this detector must never make a
+    previously-working CC transcript unparseable.
+    """
+    pi_votes = claude_votes = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 200:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rtype = rec.get("type")
+                if rtype == "message":
+                    pi_votes += 1
+                elif rtype in ("user", "assistant"):
+                    claude_votes += 1
+                elif rtype == "session" and "parentId" in rec:
+                    pi_votes += 1
+                if pi_votes + claude_votes >= probe:
+                    break
+    except OSError:
+        return "claude"
+    return "pi" if pi_votes > claude_votes else "claude"
+
+
+def parse_transcript(path: str) -> Iterator[dict]:
+    """Dispatch to the correct parser by sniffing the file's shape."""
+    if detect_transcript_format(path) == "pi":
+        return parse_pi_jsonl(path)
+    return parse_claude_jsonl(path)
+
+
+# ── Cursor resolution ────────────────────────────────────────────────
 
 def get_palace_cursor(collection, session_id: str) -> Optional[str]:
     """Return the max timestamp of drawers for this session_id, or None.
@@ -259,7 +430,7 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         batch_docs.clear()
         batch_metas.clear()
 
-    for rec in parse_claude_jsonl(jsonl_path):
+    for rec in parse_transcript(jsonl_path):
         sid = rec["session_id"]
         if sid not in cursors:
             cursors[sid] = get_palace_cursor(collection, sid)
